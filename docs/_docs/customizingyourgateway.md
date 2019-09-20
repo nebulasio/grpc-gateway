@@ -28,24 +28,94 @@ The protocol buffer compiler generates camelCase JSON tags that can be used with
    mux := runtime.NewServeMux(runtime.WithMarshalerOption(runtime.MIMEWildcard, &runtime.JSONPb{OrigName:false}))
    ```
 
+### Pretty-print JSON responses when queried with ?pretty
+
+You can have Elasticsearch-style `?pretty` support in your gateway's endpoints as follows:
+
+1. Wrap the ServeMux using a stdlib [`http.HandlerFunc`](https://golang.org/pkg/net/http/#HandlerFunc)
+   that translates the provided query parameter into a custom `Accept` header, and
+2. Register a pretty-printing marshaler for that MIME code.
+
+For example:
+
+```go
+mux := runtime.NewServeMux(
+	runtime.WithMarshalerOption("application/json+pretty", &runtime.JSONPb{Indent: "  "}),
+)
+prettier := func(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// checking Values as map[string][]string also catches ?pretty and ?pretty=
+		// r.URL.Query().Get("pretty") would not.
+		if _, ok := r.URL.Query()["pretty"]; ok {
+			r.Header.Set("Accept", "application/json+pretty")
+		}
+		h.ServeHTTP(w, r)
+	})
+}
+http.ListenAndServe(":8080", prettier(mux))
+```
+
+Note that  `runtime.JSONPb{Indent: "  "}` will do the trick for pretty-printing: it wraps
+`jsonpb.Marshaler`:
+```go
+type Marshaler struct {
+	// ...
+
+	// A string to indent each level by. The presence of this field will
+	// also cause a space to appear between the field separator and
+	// value, and for newlines to be appear between fields and array
+	// elements.
+	Indent string
+
+	// ...
+}
+```
+
+Now, either when passing the header `Accept: application/json+pretty` or appending `?pretty` to
+your HTTP endpoints, the response will be pretty-printed.
+
+Note that this will conflict with any methods having input messages with fields named `pretty`;
+also, this example code does not remove the query parameter `pretty` from further processing.
+
 ## Mapping from HTTP request headers to gRPC client metadata
 You might not like [the default mapping rule](http://godoc.org/github.com/grpc-ecosystem/grpc-gateway/runtime#DefaultHeaderMatcher) and might want to pass through all the HTTP headers, for example.
 
 1. Write a [`HeaderMatcherFunc`](http://godoc.org/github.com/grpc-ecosystem/grpc-gateway/runtime#HeaderMatcherFunc).
 2. Register the function with [`WithIncomingHeaderMatcher`](http://godoc.org/github.com/grpc-ecosystem/grpc-gateway/runtime#WithIncomingHeaderMatcher)
 
-   e.g.
-   ```go
-   func yourMatcher(headerName string) (mdName string, ok bool) {
-   	...
-   }
-   ...
-   mux := runtime.NewServeMux(runtime.WithIncomingHeaderMatcher(yourMatcher))
+  e.g.
+  ```go
+  func CustomMatcher(key string) (string, bool) {
+    switch key {
+    case "x-custom-header1":
+      return key, true
+    case "x-custom-header2":
+      return "custom-header2", true
+    default:
+      return key, false
+    }
+  }
+  ...
 
-   ```
+  mux := runtime.NewServeMux(runtime.WithIncomingHeaderMatcher(CustomMatcher))
+
+  ```
 
 ## Mapping from gRPC server metadata to HTTP response headers
-ditto. Use [`WithOutgoingHeaderMatcher`](http://godoc.org/github.com/grpc-ecosystem/grpc-gateway/runtime#WithOutgoingHeaderMatcher)
+ditto. Use [`WithOutgoingHeaderMatcher`](http://godoc.org/github.com/grpc-ecosystem/grpc-gateway/runtime#WithOutgoingHeaderMatcher).
+See [gRPC metadata docs](https://github.com/grpc/grpc-go/blob/master/Documentation/grpc-metadata.md)
+for more info on sending / receiving gRPC metadata.
+
+  e.g.
+
+  ```go
+  ...
+  if appendCustomHeader {
+    grpc.SendHeader(ctx, metadata.New(map[string]string{
+			"x-custom-header1": "value",
+		}))
+  }
+  ```
 
 ## Mutate response messages or set response headers
 You might want to return a subset of response fields as HTTP response headers; 
@@ -55,8 +125,13 @@ Or you might want to mutate the response messages to be returned.
 1. Write a filter function.
    ```go
    func myFilter(ctx context.Context, w http.ResponseWriter, resp proto.Message) error {
-   	w.Header().Set("X-My-Tracking-Token", resp.Token)
-   	resp.Token = ""
+        t, ok := resp.(*externalpb.Tokenizer)
+
+	if ok {
+	  w.Header().Set("X-My-Tracking-Token", t.Token)
+	  t.Token = ""
+	}
+
    	return nil
    }
    ```
@@ -105,8 +180,97 @@ if err := http.ListenAndServe(":8080", tracingWrapper(mux)); err != nil {
 }
 ```
 
+Finally, don't forget to add a tracing interceptor when registering
+the services. E.g.
+
+```go
+import (
+   ...
+   "google.golang.org/grpc"
+   "github.com/grpc-ecosystem/go-grpc-middleware/tracing/opentracing"
+)
+
+opts := []grpc.DialOption{
+  grpc.WithUnaryInterceptor(
+    grpc_opentracing.UnaryClientInterceptor(
+      grpc_opentracing.WithTracer(opentracing.GlobalTracer()),
+    ),
+  ),
+}
+if err := pb.RegisterMyServiceHandlerFromEndpoint(ctx, mux, serviceEndpoint, opts); err != nil {
+	log.Fatalf("could not register HTTP service: %v", err)
+}
+```
+
 ## Error handler
 http://mycodesmells.com/post/grpc-gateway-error-handler
+
+## Stream Error Handler
+The error handler described in the previous section applies only
+to RPC methods that have a unary response.
+
+When the method has a streaming response, grpc-gateway handles
+that by emitting a newline-separated stream of "chunks". Each
+chunk is an envelope that can container either a response message
+or an error. Only the last chunk will include an error, and only
+when the RPC handler ends abnormally (i.e. with an error code).
+
+Because of the way the errors are included in the response body,
+the other error handler signature is insufficient. So for server
+streams, you must install a _different_ error handler:
+
+```go
+mux := runtime.NewServeMux(
+	runtime.WithStreamErrorHandler(handleStreamError))
+```
+
+The signature of the handler is much more rigid because we need
+to know the structure of the error payload in order to properly
+encode the "chunk" schema into a Swagger/OpenAPI spec.
+
+So the function must return a `*runtime.StreamError`. The handler
+can choose to omit some fields and can filter/transform the original
+error, such as stripping stack traces from error messages.
+
+Here's an example custom handler:
+```go
+// handleStreamError overrides default behavior for computing an error
+// message for a server stream.
+//
+// It uses a default "502 Bad Gateway" HTTP code; only emits "safe"
+// messages; and does not set gRPC code or details fields (so they will
+// be omitted from the resulting JSON object that is sent to client).
+func handleStreamError(ctx context.Context, err error) *runtime.StreamError {
+	code := http.StatusBadGateway
+	msg := "unexpected error"
+	if s, ok := status.FromError(err); ok {
+		code = runtime.HTTPStatusFromCode(s.Code())
+		// default message, based on the name of the gRPC code
+		msg = code.String()
+		// see if error details include "safe" message to send
+		// to external callers
+		for _, msg := s.Details() {
+			if safe, ok := msg.(*SafeMessage); ok {
+				msg = safe.Text
+				break
+			}
+		}
+	}
+	return &runtime.StreamError{
+	    HttpCode:   int32(code),
+	    HttpStatus: http.StatusText(code),
+	    Message:    msg,
+	}
+}
+```
+
+If no custom handler is provided, the default stream error handler
+will include any gRPC error attributes (code, message, detail messages),
+if the error being reported includes them. If the error does not have
+these attributes, a gRPC code of `Unknown` (2) is reported. The default
+handler will also include an HTTP code and status, which is derived
+from the gRPC code (or set to `"500 Internal Server Error"` when
+the source error has no gRPC attributes).
 
 ## Replace a response forwarder per method
 You might want to keep the behavior of the current marshaler but change only a message forwarding of a certain API method.

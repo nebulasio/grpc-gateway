@@ -12,18 +12,10 @@ buildifier(
 
 # gazelle:exclude third_party
 # gazelle:exclude vendor
+# gazelle:exclude _output
+# gazelle:prefix github.com/grpc-ecosystem/grpc-gateway
 
-gazelle(
-    name = "gazelle_diff",
-    mode = "diff",
-    prefix = "github.com/grpc-ecosystem/grpc-gateway",
-)
-
-gazelle(
-    name = "gazelle_fix",
-    mode = "fix",
-    prefix = "github.com/grpc-ecosystem/grpc-gateway",
-)
+gazelle(name = "gazelle")
 
 package_group(
     name = "generators",
